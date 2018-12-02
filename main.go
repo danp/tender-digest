@@ -13,8 +13,6 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/joeshaw/envdecode"
-	sendgrid "github.com/sendgrid/sendgrid-go"
-	"github.com/sendgrid/sendgrid-go/helpers/mail"
 )
 
 const (
@@ -43,11 +41,10 @@ var (
 )
 
 var config struct {
-	SendgridAPIKey string `env:"SENDGRID_API_KEY,required"`
-	FromName       string `env:"FROM_NAME,required"`
-	FromEmail      string `env:"FROM_EMAIL,required"`
-	ToName         string `env:"TO_NAME,required"`
-	ToEmail        string `env:"TO_EMAIL,required"`
+	SendgridAPIKey string   `env:"SENDGRID_API_KEY,required"`
+	FromName       string   `env:"FROM_NAME,required"`
+	FromEmail      string   `env:"FROM_EMAIL,required"`
+	ToEmails       []string `env:"TO_EMAILS,required"`
 }
 
 func main() {
@@ -66,8 +63,7 @@ func main() {
 		apiKey:    config.SendgridAPIKey,
 		fromName:  config.FromName,
 		fromEmail: config.FromEmail,
-		toName:    config.ToName,
-		toEmail:   config.ToEmail,
+		toEmails:  config.ToEmails,
 	}
 
 	nt, err := findNew(fet, str)
@@ -234,36 +230,6 @@ func (s store) mark(id string) (bool, error) {
 	f.Close()
 
 	return true, nil
-}
-
-type notifier struct {
-	apiKey string
-
-	fromName, fromEmail string
-	toName, toEmail     string
-}
-
-func (n notifier) notify(ts []tender) error {
-	if len(ts) == 0 {
-		return nil
-	}
-
-	hmsg := "<p>These new HRM tenders have appeared:</p>\n\n"
-
-	const df = "Mon, 02 Jan 2006"
-	for _, t := range ts {
-		hmsg += "<h3><a href=\"" + t.URL + "\">" + t.Description + "</a></h3>\n"
-		hmsg += "Issued " + t.IssuedDate.Format(df) + " and closing " + t.CloseDate.Format(df) + "\n\n"
-	}
-
-	from := mail.NewEmail(n.fromName, n.fromEmail)
-	to := mail.NewEmail(n.toName, n.toEmail)
-	emsg := mail.NewContent("text/html", hmsg)
-	email := mail.NewV3MailInit(from, "New HRM Tenders at "+time.Now().Format(time.RFC822), to, emsg)
-
-	client := sendgrid.NewSendClient(n.apiKey)
-	_, err := client.Send(email)
-	return err
 }
 
 func findNew(fet *fetcher, st *store) ([]tender, error) {
