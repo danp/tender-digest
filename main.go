@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -52,7 +54,7 @@ func main() {
 	envdecode.MustStrictDecode(&config)
 
 	fet := &fetcher{
-		baseURL: "https://novascotia.ca/tenders/tenders/ns-tenders.aspx",
+		baseURL: "https://procurement.novascotia.ca/ns-tenders.aspx",
 	}
 
 	str := &store{
@@ -122,7 +124,12 @@ func (f fetcher) fetch() ([]tender, error) {
 		return nil, fmt.Errorf("got status %d", getResp.StatusCode)
 	}
 
-	getDoc, err := goquery.NewDocumentFromResponse(getResp)
+	b, err := ioutil.ReadAll(getResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	getDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -134,20 +141,20 @@ func (f fetcher) fetch() ([]tender, error) {
 		vals.Set(n, v)
 	})
 
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$ddDateRange", "0")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$tbSearchTenderID", "")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$tbDescription", "")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$ddCategoryList", "0")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$ddDeptAgency", "Halifax Regional Municipality (HRM)")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$ddPageSize", "100")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_3$btnFilter", "Filter")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddDateRange", "0")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$tbSearchTenderID", "")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$tbDescription", "")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddCategoryList", "0")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddDeptAgency", "Halifax Regional Municipality (HRM)")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddPageSize", "100")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$btnFilter", "Filter")
 
 	postReq, err := http.NewRequest("POST", purl.String(), strings.NewReader(vals.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postReq.Header.Set("Origin", "https://novascotia.ca")
+	postReq.Header.Set("Origin", "https://procurement.novascotia.ca")
 	postReq.Header.Set("Referer", purl.String())
 	postReq.Header.Set("Cookie", getResp.Header.Get("Set-Cookie"))
 
@@ -161,7 +168,12 @@ func (f fetcher) fetch() ([]tender, error) {
 		return nil, fmt.Errorf("got status %d", postResp.StatusCode)
 	}
 
-	postDoc, err := goquery.NewDocumentFromResponse(postResp)
+	b, err = ioutil.ReadAll(postResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	postDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +183,7 @@ func (f fetcher) fetch() ([]tender, error) {
 		ts []tender
 	)
 
-	postDoc.Find("table#ctl00_ctl00_ctl00_ContentPlaceHolderDefault_childContent_u_NSTendersgrid_v2_3_GridView1 > tbody > tr").
+	postDoc.Find("table#ctl00_ctl00_ctl00_ContentPlaceHolderDefault_childContent_u_NSTendersgrid_v2_2_GridView1 > tbody > tr").
 		Not(".gridfooter").
 		Each(c.each(func(_ int, s *goquery.Selection) error {
 			if s.Find("th").Length() > 0 {
