@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	dateFormat = "2 January 2006"
+	dateFormat = "02 Jan 2006"
 )
 
 type tender struct {
@@ -189,11 +189,14 @@ func (f fetcher) fetch() ([]tender, error) {
 			if s.Find("th").Length() > 0 {
 				return nil
 			}
+			if s.HasClass("ProcPagination") {
+				return nil
+			}
 
 			var t tender
-			t.ID = s.Find("td:nth-child(1) a").Text()
+			t.ID = s.Find("td:nth-child(2) a").Text()
 
-			href, ok := s.Find("td:nth-child(1) a").Attr("href")
+			href, ok := s.Find("td:nth-child(2) a").Attr("href")
 			if !ok {
 				return fmt.Errorf("%s missing href", t.ID)
 			}
@@ -203,16 +206,23 @@ func (f fetcher) fetch() ([]tender, error) {
 			}
 
 			t.URL = hurl.String()
-			t.Agency = strings.TrimSpace(s.Find("td:nth-child(1) span").Text())
-			t.Description = strings.TrimSpace(s.Find("td:nth-child(2)").Text())
+			t.Agency = strings.TrimSpace(s.Find("td:nth-child(2) span").Text())
+			t.Description = strings.TrimSpace(s.Find("td:nth-child(3)").Text())
 
-			id, err := time.Parse(dateFormat, s.Find("td:nth-child(3)").Text())
+			spanStrings := s.Find("td:nth-child(4) span").Map(func(_ int, ss *goquery.Selection) string {
+				return ss.Text()
+			})
+			if len(spanStrings) != 2 {
+				return fmt.Errorf("expected 2 date spans for id %q, found %d", t.ID, len(spanStrings))
+			}
+
+			id, err := time.Parse(dateFormat, spanStrings[1])
 			if err != nil {
 				return err
 			}
 			t.IssuedDate = id
 
-			cd, err := time.Parse(dateFormat, s.Find("td:nth-child(4)").Text())
+			cd, err := time.Parse(dateFormat, spanStrings[0])
 			if err != nil {
 				return err
 			}
