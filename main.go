@@ -84,7 +84,6 @@ func main() {
 
 type coll struct {
 	err error
-	ts  []tender
 }
 
 func (c *coll) each(f func(_ int, s *goquery.Selection) error) func(_ int, s *goquery.Selection) {
