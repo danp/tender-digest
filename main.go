@@ -2,19 +2,19 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/joeshaw/envdecode"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -53,13 +53,19 @@ func main() {
 	flag.Parse()
 	envdecode.MustStrictDecode(&config)
 
-	fet := &fetcher{
+	fet := fetcher{
 		baseURL: "https://procurement.novascotia.ca/ns-tenders.aspx",
 	}
 
-	str := &store{
-		dir: "store",
+	db, err := sql.Open("sqlite", "file:store.db?_time_format=sqlite")
+	if err != nil {
+		log.Fatal(err)
 	}
+	if _, err := db.Exec("create table if not exists tenders (id text primary key, url text, description text, agency text, issued datetime, close datetime, first_observed datetime)"); err != nil {
+		log.Fatal(err)
+	}
+
+	st := store{db}
 
 	not := &notifier{
 		apiKey:    config.SendgridAPIKey,
@@ -68,12 +74,15 @@ func main() {
 		toEmails:  config.ToEmails,
 	}
 
-	nt, err := findNew(fet, str)
+	nt, err := findNew(fet, st)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if *skipNotify {
+		for _, t := range nt {
+			fmt.Println(t.ID, t.Description)
+		}
 		return
 	}
 
@@ -235,25 +244,28 @@ func (f fetcher) fetch() ([]tender, error) {
 }
 
 type store struct {
-	dir string
+	db *sql.DB
 }
 
-func (s store) mark(id string) (bool, error) {
-	p := filepath.Join(s.dir, id)
+func (s store) add(t tender) (bool, error) {
+	const dateFormat = "2006-01-02"
 
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL, 0666)
+	res, err := s.db.Exec("insert into tenders (id, url, description, agency, issued, close, first_observed) values (?, ?, ?, ?, ?, ?, ?) on conflict do nothing",
+		t.ID, t.URL, t.Description, t.Agency, t.IssuedDate.Format(dateFormat), t.CloseDate.Format(dateFormat), time.Now(),
+	)
 	if err != nil {
-		if os.IsExist(err) {
-			return false, nil
-		}
-		return false, err
+		return false, fmt.Errorf("insert: %v", err)
 	}
-	f.Close()
 
-	return true, nil
+	ra, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("affected: %v", err)
+	}
+
+	return ra > 0, nil
 }
 
-func findNew(fet *fetcher, st *store) ([]tender, error) {
+func findNew(fet fetcher, st store) ([]tender, error) {
 	ct, err := fet.fetch()
 	if err != nil {
 		return nil, err
@@ -261,7 +273,7 @@ func findNew(fet *fetcher, st *store) ([]tender, error) {
 
 	var nt []tender
 	for _, t := range ct {
-		isNew, err := st.mark(t.ID)
+		isNew, err := st.add(t)
 		if err != nil {
 			return nil, err
 		}
