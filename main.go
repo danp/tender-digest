@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -18,27 +19,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/joeshaw/envdecode"
 	_ "modernc.org/sqlite"
-)
-
-type Tender struct {
-	ID          string
-	URL         string
-	Description string
-	Agency      string
-	IssuedDate  time.Time
-	CloseDate   time.Time
-}
-
-var (
-	baseHeaders = map[string]string{
-		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-		"Accept-Language":           "en-US,en;q=0.9",
-		"Cache-Control":             "max-age=0",
-		"Upgrade-Insecure-Requests": "1",
-		"User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
-	}
-
-	skipNotify = flag.Bool("skip-notify", false, "skip notification, such as for initializing store")
 )
 
 var config struct {
@@ -49,7 +29,12 @@ var config struct {
 }
 
 func main() {
-	flag.Parse()
+	fs := flag.NewFlagSet("tender-digest", flag.ExitOnError)
+	var dbFile string
+	var skipNotify bool
+	fs.StringVar(&dbFile, "db-file", "store.db", "sqlite database filename")
+	fs.BoolVar(&skipNotify, "skip-notify", false, "skip notification, such as for initializing store")
+	fs.Parse(os.Args[1:])
 	envdecode.MustStrictDecode(&config)
 
 	ctx := context.Background()
@@ -59,7 +44,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	db, err := sql.Open("sqlite", "file:store.db?_time_format=sqlite")
+	db, err := sql.Open("sqlite", "file:"+dbFile+"?_time_format=sqlite")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -81,7 +66,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if *skipNotify {
+	if skipNotify {
 		for _, t := range nt {
 			fmt.Println(t.ID, t.Description)
 		}
@@ -127,6 +112,23 @@ func NewClient(baseURL string) (*Client, error) {
 	c := &http.Client{Jar: jar}
 
 	return &Client{u, c, false, nil}, nil
+}
+
+var baseHeaders = map[string]string{
+	"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+	"Accept-Language":           "en-US,en;q=0.9",
+	"Cache-Control":             "max-age=0",
+	"Upgrade-Insecure-Requests": "1",
+	"User-Agent":                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
+}
+
+type Tender struct {
+	ID          string
+	URL         string
+	Description string
+	Agency      string
+	IssuedDate  time.Time
+	CloseDate   time.Time
 }
 
 func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken string, _ error) {
