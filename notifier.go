@@ -14,7 +14,7 @@ type notifier struct {
 	toEmails            []string
 }
 
-func (n notifier) notify(ts []tender) error {
+func (n notifier) notify(ts []Tender) error {
 	if len(ts) == 0 {
 		return nil
 	}

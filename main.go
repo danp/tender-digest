@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,11 +20,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const (
-	dateFormat = "02 Jan 2006"
-)
-
-type tender struct {
+type Tender struct {
 	ID          string
 	URL         string
 	Description string
@@ -53,8 +52,11 @@ func main() {
 	flag.Parse()
 	envdecode.MustStrictDecode(&config)
 
-	fet := fetcher{
-		baseURL: "https://procurement.novascotia.ca/ns-tenders.aspx",
+	ctx := context.Background()
+
+	cl, err := NewClient("https://procurement.novascotia.ca/ns-tenders.aspx")
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	db, err := sql.Open("sqlite", "file:store.db?_time_format=sqlite")
@@ -74,7 +76,7 @@ func main() {
 		toEmails:  config.ToEmails,
 	}
 
-	nt, err := findNew(fet, st)
+	nt, err := findNew(ctx, cl, st)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -104,94 +106,112 @@ func (c *coll) each(f func(_ int, s *goquery.Selection) error) func(_ int, s *go
 	}
 }
 
-type fetcher struct {
-	baseURL string
+type Client struct {
+	u     *url.URL
+	c     *http.Client
+	ready bool
+	vals  url.Values
 }
 
-func (f fetcher) fetch() ([]tender, error) {
-	purl, err := url.Parse(f.baseURL)
+func NewClient(baseURL string) (*Client, error) {
+	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	getReq, err := http.NewRequest("GET", purl.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range baseHeaders {
-		getReq.Header.Set(k, v)
-	}
-
-	getResp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		return nil, err
-	}
-	defer getResp.Body.Close()
-
-	if getResp.StatusCode != 200 {
-		return nil, fmt.Errorf("got status %d", getResp.StatusCode)
-	}
-
-	b, err := ioutil.ReadAll(getResp.Body)
+	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	getDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
-	if err != nil {
-		return nil, err
+	c := &http.Client{Jar: jar}
+
+	return &Client{u, c, false, nil}, nil
+}
+
+func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken string, _ error) {
+	if !f.ready {
+		if token != "" {
+			return nil, "", fmt.Errorf("List must first be called with empty token")
+		}
+		if err := f.init(ctx); err != nil {
+			return nil, "", err
+		}
+		f.ready = true
 	}
 
-	vals := make(url.Values)
-	getDoc.Find("form#aspnetForm input[type=hidden]").Each(func(_ int, s *goquery.Selection) {
-		n, _ := s.Attr("name")
-		v, _ := s.Attr("value")
-		vals.Set(n, v)
-	})
+	page := 1
+	if token != "" {
+		p, err := strconv.Atoi(token)
+		if err != nil {
+			return nil, "", err
+		}
+		page = p
+	}
+
+	vals := f.vals
+
+	const pageSize = 100
 
 	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddDateRange", "0")
 	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$tbSearchTenderID", "")
 	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$tbDescription", "")
 	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddCategoryList", "0")
 	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddDeptAgency", "Halifax Regional Municipality (HRM)")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddPageSize", "100")
-	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$btnFilter", "Filter")
+	vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$ddPageSize", fmt.Sprint(pageSize))
 
-	postReq, err := http.NewRequest("POST", purl.String(), strings.NewReader(vals.Encode()))
+	if page > 1 {
+		vals.Set("__EVENTTARGET", "ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$GridView1")
+		vals.Set("__EVENTARGUMENT", "Page$"+fmt.Sprint(page))
+	} else {
+		vals.Set("ctl00$ctl00$ctl00$ContentPlaceHolderDefault$childContent$u_NSTendersgrid_v2_2$btnFilter", "Filter")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", f.u.String(), strings.NewReader(vals.Encode()))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postReq.Header.Set("Origin", "https://procurement.novascotia.ca")
-	postReq.Header.Set("Referer", purl.String())
-	postReq.Header.Set("Cookie", getResp.Header.Get("Set-Cookie"))
+	for k, v := range baseHeaders {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://procurement.novascotia.ca")
+	req.Header.Set("Referer", f.u.String())
 
-	postResp, err := http.DefaultClient.Do(postReq)
+	resp, err := f.c.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	defer postResp.Body.Close()
+	defer resp.Body.Close()
 
-	if postResp.StatusCode != 200 {
-		return nil, fmt.Errorf("got status %d", postResp.StatusCode)
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("got status %d", resp.StatusCode)
 	}
 
-	b, err = ioutil.ReadAll(postResp.Body)
+	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	postDoc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+
+	vals = make(url.Values)
+	doc.Find("form#aspnetForm input[type=hidden]").Each(func(_ int, s *goquery.Selection) {
+		n, _ := s.Attr("name")
+		v, _ := s.Attr("value")
+		vals.Set(n, v)
+	})
+	f.vals = vals
 
 	var (
 		c  = &coll{}
-		ts []tender
+		ts []Tender
 	)
 
-	postDoc.Find("table#ctl00_ctl00_ctl00_ContentPlaceHolderDefault_childContent_u_NSTendersgrid_v2_2_GridView1 > tbody > tr").
+	doc.Find("table#ctl00_ctl00_ctl00_ContentPlaceHolderDefault_childContent_u_NSTendersgrid_v2_2_GridView1 > tbody > tr").
 		Not(".gridfooter").
 		Each(c.each(func(_ int, s *goquery.Selection) error {
 			if s.Find("th").Length() > 0 {
@@ -201,14 +221,14 @@ func (f fetcher) fetch() ([]tender, error) {
 				return nil
 			}
 
-			var t tender
+			var t Tender
 			t.ID = s.Find("td:nth-child(2) a").Text()
 
 			href, ok := s.Find("td:nth-child(2) a").Attr("href")
 			if !ok {
 				return fmt.Errorf("%s missing href", t.ID)
 			}
-			hurl, err := purl.Parse(href)
+			hurl, err := f.u.Parse(href)
 			if err != nil {
 				return err
 			}
@@ -223,6 +243,8 @@ func (f fetcher) fetch() ([]tender, error) {
 			if len(spanStrings) != 2 {
 				return fmt.Errorf("expected 2 date spans for id %q, found %d", t.ID, len(spanStrings))
 			}
+
+			const dateFormat = "02 Jan 2006"
 
 			id, err := time.Parse(dateFormat, spanStrings[1])
 			if err != nil {
@@ -239,17 +261,66 @@ func (f fetcher) fetch() ([]tender, error) {
 			ts = append(ts, t)
 			return nil
 		}))
+	if c.err != nil {
+		return nil, "", c.err
+	}
 
-	return ts, c.err
+	token = ""
+	if len(ts) >= pageSize {
+		page++
+		token = fmt.Sprint(page)
+	}
+
+	return ts, token, c.err
+}
+
+func (f *Client) init(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", f.u.String(), nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range baseHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := f.c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("got status %d", resp.StatusCode)
+	}
+
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+
+	vals := make(url.Values)
+	doc.Find("form#aspnetForm input[type=hidden]").Each(func(_ int, s *goquery.Selection) {
+		n, _ := s.Attr("name")
+		v, _ := s.Attr("value")
+		vals.Set(n, v)
+	})
+	f.vals = vals
+
+	return nil
 }
 
 type store struct {
 	db *sql.DB
 }
 
-func (s store) add(t tender) (bool, error) {
-	const dateFormat = "2006-01-02"
+const dateFormat = "2006-01-02"
 
+func (s store) add(t Tender) (bool, error) {
 	res, err := s.db.Exec("insert into tenders (id, url, description, agency, issued, close, first_observed) values (?, ?, ?, ?, ?, ?, ?) on conflict do nothing",
 		t.ID, t.URL, t.Description, t.Agency, t.IssuedDate.Format(dateFormat), t.CloseDate.Format(dateFormat), time.Now(),
 	)
@@ -265,21 +336,59 @@ func (s store) add(t tender) (bool, error) {
 	return ra > 0, nil
 }
 
-func findNew(fet fetcher, st store) ([]tender, error) {
-	ct, err := fet.fetch()
+func (s store) maxIssued() (time.Time, error) {
+	var ts sql.NullString
+	if err := s.db.QueryRow("select max(issued) from tenders").Scan(&ts); err != nil {
+		return time.Time{}, err
+	}
+	if !ts.Valid {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(dateFormat, ts.String)
+	if err != nil {
+		return time.Time{}, nil
+	}
+	return t, nil
+}
+
+func findNew(ctx context.Context, cl *Client, st store) ([]Tender, error) {
+	max, err := st.maxIssued()
 	if err != nil {
 		return nil, err
 	}
+	start := max
+	if !start.IsZero() {
+		start = start.AddDate(0, -1, 0)
+	}
 
-	var nt []tender
-	for _, t := range ct {
-		isNew, err := st.add(t)
+	var nt []Tender
+
+	var token string
+outer:
+	for {
+		ct, nextToken, err := cl.List(ctx, token)
 		if err != nil {
 			return nil, err
 		}
-		if isNew {
-			nt = append(nt, t)
+
+		for _, t := range ct {
+			isNew, err := st.add(t)
+			if err != nil {
+				return nil, err
+			}
+			if isNew {
+				nt = append(nt, t)
+			}
+
+			if t.IssuedDate.Before(start) {
+				break outer
+			}
 		}
+
+		if nextToken == "" {
+			break
+		}
+		token = nextToken
 	}
 
 	return nt, nil
