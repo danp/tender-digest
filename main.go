@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -186,7 +186,7 @@ func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken 
 		return nil, "", fmt.Errorf("got status %d", resp.StatusCode)
 	}
 
-	b, err = ioutil.ReadAll(resp.Body)
+	b, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", err
 	}
@@ -258,7 +258,7 @@ func (f *Client) init(ctx context.Context) error {
 		return fmt.Errorf("got status %d", resp.StatusCode)
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
