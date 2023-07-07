@@ -17,20 +17,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joeshaw/envdecode"
 	_ "modernc.org/sqlite"
 )
 
 // currently requires a locally applied fix for https://github.com/golang/go/issues/44591 to
 // work properly, such as the range over raw in
 // https://github.com/golang/go/issues/44591#issuecomment-825100135.
-
-var config struct {
-	SendgridAPIKey string   `env:"SENDGRID_API_KEY,required"`
-	FromName       string   `env:"FROM_NAME,required"`
-	FromEmail      string   `env:"FROM_EMAIL,required"`
-	ToEmails       []string `env:"TO_EMAILS,required"`
-}
 
 func main() {
 	fs := flag.NewFlagSet("tender-digest", flag.ExitOnError)
@@ -39,7 +31,13 @@ func main() {
 	fs.StringVar(&dbFile, "db-file", "store.db", "sqlite database filename")
 	fs.BoolVar(&skipNotify, "skip-notify", false, "skip notification, such as for initializing store")
 	fs.Parse(os.Args[1:])
-	envdecode.MustStrictDecode(&config)
+
+	var (
+		sendgridAPIKey = os.Getenv("SENDGRID_API_KEY")
+		fromName       = os.Getenv("FROM_NAME")
+		fromEmail      = os.Getenv("FROM_EMAIL")
+		toEmails       = os.Getenv("TO_EMAILS")
+	)
 
 	ctx := context.Background()
 
@@ -58,23 +56,23 @@ func main() {
 
 	st := store{db}
 
-	not := &notifier{
-		apiKey:    config.SendgridAPIKey,
-		fromName:  config.FromName,
-		fromEmail: config.FromEmail,
-		toEmails:  config.ToEmails,
-	}
-
 	nt, err := findNew(ctx, cl, st)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if skipNotify {
+	if sendgridAPIKey == "" || skipNotify {
 		for _, t := range nt {
 			fmt.Println(t.ID, t.Description)
 		}
 		return
+	}
+
+	not := notifier{
+		apiKey:    sendgridAPIKey,
+		fromName:  fromName,
+		fromEmail: fromEmail,
+		toEmails:  strings.Split(toEmails, ";"),
 	}
 
 	if err := not.notify(nt); err != nil {
@@ -120,14 +118,8 @@ type Tender struct {
 }
 
 func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken string, _ error) {
-	if !f.ready {
-		if token != "" {
-			return nil, "", fmt.Errorf("List must first be called with empty token")
-		}
-		if err := f.init(ctx); err != nil {
-			return nil, "", err
-		}
-		f.ready = true
+	if err := f.init(ctx); err != nil {
+		return nil, "", err
 	}
 
 	page := 1
@@ -220,9 +212,18 @@ func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken 
 			return nil, "", err
 		}
 
+		cURL, err := f.tenderClosingLocationURL(ctx, td.TenderID)
+		if err != nil {
+			return nil, "", err
+		}
+		// https://halifax.bidsandtenders.ca/Module/Tenders/en/Tender/Detail/88f81afc-599b-4eab-9be6-57961f8b22
+		if cURL == "" || !strings.Contains(cURL, "Detail") {
+			cURL = f.u.String() + "/tenders/" + td.TenderID
+		}
+
 		ts = append(ts, Tender{
 			ID:          td.TenderID,
-			URL:         f.u.String() + "/tenders/" + td.TenderID,
+			URL:         cURL,
 			Description: td.Title,
 			Agency:      td.ProcurementEntity,
 			IssuedDate:  pd,
@@ -239,7 +240,77 @@ func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken 
 	return ts, token, nil
 }
 
+func (f *Client) tenderClosingLocationURL(ctx context.Context, id string) (string, error) {
+	if err := f.init(ctx); err != nil {
+		return "", err
+	}
+
+	q := make(url.Values)
+	q.Set("tenderId", id)
+
+	u, err := f.u.Parse("/procurementui/tenders")
+	if err != nil {
+		return "", err
+	}
+
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	for k, v := range baseHeaders {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.token)
+
+	resp, err := f.c.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("got status %d", resp.StatusCode)
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	type tenderData struct {
+		ClosingLocation string
+	}
+	var respBody struct {
+		TenderDataList []tenderData
+	}
+
+	if err := json.Unmarshal(b, &respBody); err != nil {
+		return "", err
+	}
+
+	if len(respBody.TenderDataList) != 1 {
+		return "", nil
+	}
+
+	loc := respBody.TenderDataList[0].ClosingLocation
+	if loc == "" {
+		return "", nil
+	}
+
+	locU, err := url.Parse(loc)
+	if err != nil {
+		return "", nil
+	}
+	return locU.String(), nil
+}
+
 func (f *Client) init(ctx context.Context) error {
+	if f.ready {
+		return nil
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", f.u.String()+"/procurementui/authenticate", strings.NewReader(`{"rpid":"GUEST"}`))
 	if err != nil {
 		return err
@@ -276,6 +347,7 @@ func (f *Client) init(ctx context.Context) error {
 
 	f.token = body.JWTToken
 
+	f.ready = true
 	return nil
 }
 
