@@ -1,22 +1,21 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"strconv"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/playwright-community/playwright-go"
 	_ "modernc.org/sqlite"
 )
 
@@ -41,10 +40,11 @@ func main() {
 
 	ctx := context.Background()
 
-	cl, err := NewClient("https://procurement-portal.novascotia.ca")
+	cl, err := NewClient("https://halifax.bidsandtenders.ca/Module/Tenders/en")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer cl.Close()
 
 	db, err := sql.Open("sqlite", "file:"+dbFile+"?_time_format=sqlite")
 	if err != nil {
@@ -81,10 +81,13 @@ func main() {
 }
 
 type Client struct {
-	u     *url.URL
-	c     *http.Client
-	ready bool
-	token string
+	u           *url.URL
+	pw          *playwright.Playwright
+	b           playwright.Browser
+	p           playwright.Page
+	ready       bool
+	responsesMu sync.Mutex
+	responses   []RawTenders
 }
 
 func NewClient(baseURL string) (*Client, error) {
@@ -92,21 +95,7 @@ func NewClient(baseURL string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	c := &http.Client{Jar: jar}
-
-	return &Client{u, c, false, ""}, nil
-}
-
-var baseHeaders = map[string]string{
-	"Accept":       "application/json",
-	"Content-Type": "application/json",
-	"User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+	return &Client{u: u}, nil
 }
 
 type Tender struct {
@@ -118,237 +107,170 @@ type Tender struct {
 	CloseDate   time.Time
 }
 
-func (f *Client) List(ctx context.Context, token string) (_ []Tender, nextToken string, _ error) {
-	if err := f.init(ctx); err != nil {
+var squeezeRe = regexp.MustCompile(`\s+`)
+var unprintableRe = regexp.MustCompile(`[[:^print:]]`)
+
+func (c *Client) List(ctx context.Context, token string) (_ []Tender, nextToken string, _ error) {
+	if err := c.init(ctx); err != nil {
 		return nil, "", err
 	}
 
-	page := 1
 	if token != "" {
-		p, err := strconv.Atoi(token)
+		next := c.p.GetByLabel("next page")
+		if err := next.Click(); err != nil {
+			return nil, "", fmt.Errorf("clicking next: %w", err)
+		}
+	}
+
+	err := c.p.Locator("#myRepeater > div.repeater-viewport > div.repeater-canvas.borderless-grid > div > div > table > tbody").WaitFor()
+	if err != nil {
+		return nil, "", fmt.Errorf("waiting for table: %w", err)
+	}
+
+	c.responsesMu.Lock()
+	defer c.responsesMu.Unlock()
+
+	if len(c.responses) == 0 {
+		return nil, "", errors.New("no responses")
+	}
+
+	r := c.responses[0]
+	c.responses = c.responses[1:]
+
+	var tenders []Tender
+	for _, d := range r.Data {
+		var t Tender
+
+		id, rest, ok := strings.Cut(d.Title, " ")
+		if !ok {
+			return nil, "", fmt.Errorf("cutting title %q", d.Title)
+		}
+
+		rest = strings.TrimSpace(rest)
+		rest = strings.TrimPrefix(rest, "-")
+		rest = unprintableRe.ReplaceAllString(rest, "")
+		rest = strings.TrimSpace(rest)
+		rest = squeezeRe.ReplaceAllString(rest, " ")
+
+		t.ID = id
+		t.URL = c.u.ResolveReference(&url.URL{Path: "/Module/Tenders/en/Tender/Detail/" + d.ID}).String()
+		t.Description = rest
+		t.Agency = "Halifax Regional Municipality"
+
+		t.IssuedDate, err = time.Parse("Mon Jan 2, 2006 3:04:05 PM", d.DateAvailableDisplay)
 		if err != nil {
-			return nil, "", err
+			return nil, "", fmt.Errorf("parsing issued date: %w", err)
 		}
-		page = p
-	}
 
-	type filter struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	}
-
-	body := struct {
-		Filters []filter `json:"filters"`
-	}{
-		Filters: []filter{{"procurementEntity", "Halifax Regional Municipality"}},
-	}
-
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	q := make(url.Values)
-	q.Set("page", strconv.Itoa(page))
-	q.Set("numberOfRecords", "25")
-	q.Set("sortType", "DATE_CREATED_DESC")
-
-	u, err := f.u.Parse("/procurementui/tenders")
-	if err != nil {
-		return nil, "", err
-	}
-
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(b))
-	if err != nil {
-		return nil, "", err
-	}
-	for k, v := range baseHeaders {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Authorization", "Bearer "+f.token)
-
-	resp, err := f.c.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, "", fmt.Errorf("got status %d", resp.StatusCode)
-	}
-
-	b, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	type tenderData struct {
-		TenderID          string
-		Title             string
-		ProcurementEntity string
-		PostDate          string
-		ClosingDate       string
-	}
-	var respBody struct {
-		TenderDataList []tenderData
-	}
-
-	if err := json.Unmarshal(b, &respBody); err != nil {
-		return nil, "", err
-	}
-
-	var ts []Tender
-	for _, td := range respBody.TenderDataList {
-		pd, err := time.Parse("2006-01-02", td.PostDate)
+		t.CloseDate, err = time.Parse("Mon Jan 2, 2006 3:04:05 PM", d.DateClosingDisplay)
 		if err != nil {
-			return nil, "", err
-		}
-		if len(td.ClosingDate) < len(time.DateOnly) {
-			return nil, "", fmt.Errorf("bad closing date %q", td.ClosingDate)
-		}
-		cd, err := time.Parse(time.DateOnly, td.ClosingDate[:len(time.DateOnly)])
-		if err != nil {
-			return nil, "", err
+			return nil, "", fmt.Errorf("parsing close date: %w", err)
 		}
 
-		cURL, err := f.tenderClosingLocationURL(ctx, td.TenderID)
-		if err != nil {
-			return nil, "", err
+		now := time.Now()
+		if t.IssuedDate.Year() == 9999 {
+			t.IssuedDate = now
 		}
-		// https://halifax.bidsandtenders.ca/Module/Tenders/en/Tender/Detail/88f81afc-599b-4eab-9be6-57961f8b22
-		if cURL == "" || !strings.Contains(cURL, "Detail") {
-			cURL = f.u.String() + "/tenders/" + td.TenderID
+		if t.CloseDate.Year() == 9999 {
+			t.CloseDate = now
 		}
 
-		ts = append(ts, Tender{
-			ID:          td.TenderID,
-			URL:         cURL,
-			Description: td.Title,
-			Agency:      td.ProcurementEntity,
-			IssuedDate:  pd,
-			CloseDate:   cd,
-		})
+		tenders = append(tenders, t)
 	}
 
-	token = ""
-	if len(ts) > 0 {
-		page++
-		token = fmt.Sprint(page)
+	time.Sleep(5 * time.Second)
+
+	next := c.p.GetByLabel("next page")
+	if ok, err := next.IsEnabled(playwright.LocatorIsEnabledOptions{Timeout: ptr(10000.0)}); err != nil {
+		return nil, "", fmt.Errorf("checking next enabled: %w", err)
+	} else if ok {
+		nextToken = "next"
 	}
 
-	return ts, token, nil
+	return tenders, nextToken, nil
 }
 
-func (f *Client) tenderClosingLocationURL(ctx context.Context, id string) (string, error) {
-	if err := f.init(ctx); err != nil {
-		return "", err
+func (c *Client) Close() error {
+	if c.b != nil {
+		if err := c.b.Close(); err != nil {
+			return err
+		}
+		c.b = nil
 	}
-
-	q := make(url.Values)
-	q.Set("tenderId", id)
-
-	u, err := f.u.Parse("/procurementui/tenders")
-	if err != nil {
-		return "", err
+	if c.pw != nil {
+		if err := c.pw.Stop(); err != nil {
+			return err
+		}
+		c.pw = nil
 	}
-
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	for k, v := range baseHeaders {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Authorization", "Bearer "+f.token)
-
-	resp, err := f.c.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("got status %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	type tenderData struct {
-		ClosingLocation string
-	}
-	var respBody struct {
-		TenderDataList []tenderData
-	}
-
-	if err := json.Unmarshal(b, &respBody); err != nil {
-		return "", err
-	}
-
-	if len(respBody.TenderDataList) != 1 {
-		return "", nil
-	}
-
-	loc := respBody.TenderDataList[0].ClosingLocation
-	if loc == "" {
-		return "", nil
-	}
-
-	locU, err := url.Parse(loc)
-	if err != nil {
-		return "", nil
-	}
-	return locU.String(), nil
+	return nil
 }
 
-func (f *Client) init(ctx context.Context) error {
-	if f.ready {
+func (c *Client) init(ctx context.Context) error {
+	if c.ready {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", f.u.String()+"/procurementui/authenticate", strings.NewReader(`{"rpid":"GUEST"}`))
+	err := playwright.Install(&playwright.RunOptions{Verbose: false, Browsers: []string{"chromium"}})
 	if err != nil {
-		return err
-	}
-	for k, v := range baseHeaders {
-		req.Header.Set(k, v)
+		return fmt.Errorf("installing playwright: %w", err)
 	}
 
-	resp, err := f.c.Do(req)
+	pw, err := playwright.Run()
 	if err != nil {
-		return err
+		return fmt.Errorf("running playwright: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("got status %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
+	// playwright.BrowserTypeLaunchOptions{Headless: ptr(false)}
+	browser, err := pw.Chromium.Launch()
 	if err != nil {
-		return err
+		return fmt.Errorf("launching browser: %w", err)
+	}
+	bctx, err := browser.NewContext()
+	if err != nil {
+		return fmt.Errorf("creating context: %w", err)
+	}
+	page, err := bctx.NewPage()
+	if err != nil {
+		return fmt.Errorf("creating page: %w", err)
 	}
 
-	var body struct {
-		JWTToken string
-	}
-	if err := json.Unmarshal(b, &body); err != nil {
-		return fmt.Errorf("unmarshaling body: %w", err)
+	page.On("response", func(r playwright.Response) {
+		if !strings.Contains(r.URL(), "/Module/Tenders/en/Tender/Search/") {
+			return
+		}
+
+		go func() {
+			b, err := r.Body()
+			if err != nil {
+				return
+			}
+			var rt RawTenders
+			if err := json.Unmarshal(b, &rt); err != nil {
+				return
+			}
+			c.responsesMu.Lock()
+			defer c.responsesMu.Unlock()
+			c.responses = append(c.responses, rt)
+		}()
+	})
+
+	if _, err = page.Goto(c.u.String()); err != nil {
+		return fmt.Errorf("going to page: %w", err)
 	}
 
-	if body.JWTToken == "" {
-		return fmt.Errorf("body does not contain jwttoken")
+	// page.get_by_role("button", name="Open Toggle Filters").click()
+	if err := page.GetByRole(*playwright.AriaRoleButton, playwright.PageGetByRoleOptions{Name: "Open Toggle Filters"}).Click(); err != nil {
+		return fmt.Errorf("clicking open toggle filters: %w", err)
+	}
+	// page.get_by_label("all", exact=True).click()
+	if err := page.GetByLabel("all", playwright.PageGetByLabelOptions{Exact: ptr(true)}).Click(); err != nil {
+		return fmt.Errorf("clicking all: %w", err)
 	}
 
-	f.token = body.JWTToken
-
-	f.ready = true
+	c.pw = pw
+	c.b = browser
+	c.p = page
+	c.ready = true
 	return nil
 }
 
@@ -374,9 +296,9 @@ func (s store) add(t Tender) (bool, error) {
 	return ra > 0, nil
 }
 
-func (s store) maxIssued() (time.Time, error) {
+func (s store) maxObserved() (time.Time, error) {
 	var ts sql.NullString
-	if err := s.db.QueryRow("select max(issued) from tenders").Scan(&ts); err != nil {
+	if err := s.db.QueryRow("select max(first_observed) from tenders").Scan(&ts); err != nil {
 		return time.Time{}, err
 	}
 	if !ts.Valid {
@@ -390,14 +312,15 @@ func (s store) maxIssued() (time.Time, error) {
 }
 
 func findNew(ctx context.Context, cl *Client, st store) ([]Tender, error) {
-	max, err := st.maxIssued()
+	max, err := st.maxObserved()
 	if err != nil {
 		return nil, err
 	}
-	start := max
-	if !start.IsZero() {
-		start = start.AddDate(0, -1, 0)
+	cutoff := max
+	if cutoff.IsZero() {
+		cutoff = time.Now()
 	}
+	cutoff = cutoff.AddDate(0, -4, 0)
 
 	var nt []Tender
 
@@ -418,7 +341,7 @@ outer:
 				nt = append(nt, t)
 			}
 
-			if t.IssuedDate.Before(start) {
+			if t.CloseDate.Before(cutoff) {
 				break outer
 			}
 		}
@@ -430,4 +353,46 @@ outer:
 	}
 
 	return nt, nil
+}
+
+func ptr[T any](v T) *T {
+	return &v
+}
+
+type RawTenders struct {
+	Success bool `json:"success"`
+	Data    []struct {
+		ID                                         string `json:"Id"`
+		Title                                      string `json:"Title"`
+		Scope                                      string `json:"Scope"`
+		Status                                     string `json:"Status"`
+		Description                                string `json:"Description"`
+		DateAvailable                              string `json:"DateAvailable"`
+		DateAvailableDisplay                       string `json:"DateAvailableDisplay"` // Fri Nov 8, 2024 12:00:00 AM
+		DatePlannedIssue                           any    `json:"DatePlannedIssue"`
+		DatePlannedIssueDisplay                    string `json:"DatePlannedIssueDisplay"`
+		DateClosing                                string `json:"DateClosing"`
+		DateClosingDisplay                         string `json:"DateClosingDisplay"` // Mon Nov 25, 2024 2:00:59 PM
+		DaysLeft                                   int    `json:"DaysLeft"`
+		DaysLeftPublish                            int    `json:"DaysLeftPublish"`
+		Submitted                                  int    `json:"Submitted"`
+		PlanTakers                                 int    `json:"PlanTakers"`
+		Advertisements                             int    `json:"Advertisements"`
+		Documents                                  int    `json:"Documents"`
+		Addendums                                  int    `json:"Addendums"`
+		ShowSubmitted                              bool   `json:"ShowSubmitted"`
+		ShowPlanTakers                             bool   `json:"ShowPlanTakers"`
+		VendorIsRegistered                         bool   `json:"VendorIsRegistered"`
+		VendorHasBidInProgress                     bool   `json:"VendorHasBidInProgress"`
+		VendorHasMultipleActiveSubmissions         bool   `json:"VendorHasMultipleActiveSubmissions"`
+		FirstSubmissionID                          string `json:"FirstSubmissionId"`
+		ShowSubmitOnline                           bool   `json:"ShowSubmitOnline"`
+		ShowRegisterAsPlanTaker                    bool   `json:"ShowRegisterAsPlanTaker"`
+		AllowBidQuestionSubmission                 bool   `json:"AllowBidQuestionSubmission"`
+		OnlyRegisteredPlantakersCanSubmitQuestions bool   `json:"OnlyRegisteredPlantakersCanSubmitQuestions"`
+		IncludeSeconds                             bool   `json:"IncludeSeconds"`
+		TimeZoneLabel                              string `json:"TimeZoneLabel"`
+		IsEmployee                                 bool   `json:"IsEmployee"`
+	} `json:"data"`
+	Total int `json:"total"`
 }
