@@ -19,10 +19,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// currently requires a locally applied fix for https://github.com/golang/go/issues/44591 to
-// work properly, such as the range over raw in
-// https://github.com/golang/go/issues/44591#issuecomment-825100135.
-
 func main() {
 	fs := flag.NewFlagSet("tender-digest", flag.ExitOnError)
 	var dbFile string
@@ -116,6 +112,7 @@ func (c *Client) List(ctx context.Context, token string) (_ []Tender, nextToken 
 	}
 
 	if token != "" {
+		log.Println("clicking next")
 		next := c.p.GetByLabel("next page")
 		if err := next.Click(); err != nil {
 			return nil, "", fmt.Errorf("clicking next: %w", err)
@@ -206,7 +203,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) init(ctx context.Context) error {
+func (c *Client) init(ctx context.Context) (rerr error) {
 	if c.ready {
 		return nil
 	}
@@ -225,7 +222,8 @@ func (c *Client) init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("launching browser: %w", err)
 	}
-	bctx, err := browser.NewContext()
+	// seems the default that includes ChromeHeadless gets assets blocked
+	bctx, err := browser.NewContext(playwright.BrowserNewContextOptions{UserAgent: ptr("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.25 Safari/537.36")})
 	if err != nil {
 		return fmt.Errorf("creating context: %w", err)
 	}
@@ -254,16 +252,26 @@ func (c *Client) init(ctx context.Context) error {
 		}()
 	})
 
+	log.Println("goto", c.u)
 	if _, err = page.Goto(c.u.String()); err != nil {
 		return fmt.Errorf("going to page: %w", err)
 	}
 
+	log.Println("sleep")
+	time.Sleep(5 * time.Second)
+
+	log.Println("click open toggle filters")
 	// page.get_by_role("button", name="Open Toggle Filters").click()
 	if err := page.GetByRole(*playwright.AriaRoleButton, playwright.PageGetByRoleOptions{Name: "Open Toggle Filters"}).Click(); err != nil {
 		return fmt.Errorf("clicking open toggle filters: %w", err)
 	}
-	// page.get_by_label("all", exact=True).click()
-	if err := page.GetByLabel("all", playwright.PageGetByLabelOptions{Exact: ptr(true)}).Click(); err != nil {
+
+	log.Println("sleep")
+	time.Sleep(5 * time.Second)
+
+	log.Println("click all")
+	// page.get_by_role("link", name="all").click()
+	if err := page.GetByRole(*playwright.AriaRoleLink, playwright.PageGetByRoleOptions{Name: "all"}).Click(); err != nil {
 		return fmt.Errorf("clicking all: %w", err)
 	}
 
