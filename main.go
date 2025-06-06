@@ -271,7 +271,7 @@ func (c *Client) init(ctx context.Context) (rerr error) {
 
 	log.Println("click all")
 	// page.get_by_role("link", name="all").click()
-	if err := page.GetByRole(*playwright.AriaRoleLink, playwright.PageGetByRoleOptions{Name: "all"}).Click(); err != nil {
+	if err := page.GetByRole(*playwright.AriaRoleLink, playwright.PageGetByRoleOptions{Name: "all", Exact: ptr(true)}).Click(); err != nil {
 		return fmt.Errorf("clicking all: %w", err)
 	}
 
